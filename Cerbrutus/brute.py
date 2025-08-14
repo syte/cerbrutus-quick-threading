@@ -100,7 +100,7 @@ class BruteUtil:
             futures = []
             for user in self.users:
                 if self.creds_found or self.stop_event.is_set():
-                    break
+                    return
                 print(f"[*] Testing user: {user}")
                 partitions = self._partition(self.passwords, self.threads_num)
                 for chunk in partitions:
@@ -130,4 +130,5 @@ class BruteUtil:
             self.end = time.time()
             print(f"\n{Fore.RED}[-] Failed to find valid credentials.{Style.RESET_ALL}")
             print(f"[*] Total time: {(self.end - self.start):.2f} seconds.")
+
 
