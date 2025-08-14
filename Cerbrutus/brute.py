@@ -1,115 +1,132 @@
-from typing import ValuesView
-import Cerbrutus.services as services
+import threading
 import time
 import sys
-import threading
 from colorama import Fore, Style
+from concurrent.futures import ThreadPoolExecutor
+import Cerbrutus.services as services
 import Cerbrutus
-'''
-Add estimated time remaining...
-Add output of how long its been running for already every few minutes.
-'''
 
 
 class BruteUtil:
-    threads = []
-    start = time.time()
-    end = time.time()
     MAX_THREADS = 1000
 
     def __init__(self, ip: str, port: int, service: str, users: list, passwords: list, threads: int = 10):
         # Validate IP
         if not isinstance(ip, str) or '.' not in ip:
-            raise ValueError("The Specified host to connect to does not seem to be a valid host.")
+            raise ValueError("The specified host to connect to does not seem to be a valid host.")
         self.ip = ip
 
         # Validate Port
         try:
             port = int(port)
         except Exception:
-            raise ValueError("[-] - The Specified port to connect to does not seem to be a valid port between 1 and 65535.")
-        if not isinstance(port, int) or 65535 < port or port < 0:
-            raise ValueError("[-] - The Specified port to connect to does not seem to be a valid port between 1 and 65535.")
+            raise ValueError("[-] The specified port is invalid (must be between 1 and 65535).")
+        if not (1 <= port <= 65535):
+            raise ValueError("[-] The specified port is invalid (must be between 1 and 65535).")
         self.port = port
-        
+
         # Validate Service
         if not isinstance(service, str) or service.upper() not in services.valid_services:
-            raise ValueError("[-] - The Specified service to connect to is not yet in the list of services. Please make a feature request, or write it and make a pull :P.")
+            raise ValueError(f"[-] Service '{service}' not supported.")
         service_info = services.valid_services[service.upper()]
         self.service = service_info["class"]
-        reccomended_threads = service_info["reccomendedThreads"]
-        self.threads_num = threads
-        if threads > reccomended_threads:
-            print(f"[!] - Maximum reccomended threads for service {service.upper()} is {reccomended_threads}...\n[!] - Be aware you may need to minimise the number of threads you use for better efficiency")
-        if threads > self.MAX_THREADS:
-            self.threads_num = self.MAX_THREADS
-            print(f"[*] - MAX NUMBER OF THREADS IS {self.MAX_THREADS}")
-        print(f"[+] - Running with {self.threads_num} threads...")
+        recommended_threads = service_info["reccomendedThreads"]
 
-        # Validate Users list
+        if threads > recommended_threads:
+            print(f"[!] Recommended threads for {service.upper()} is {recommended_threads}...")
+        self.threads_num = min(threads, self.MAX_THREADS)
+        print(f"[+] Running with {self.threads_num} threads...")
+
+        # Validate Users
         if not isinstance(users, list) or not users:
-            raise ValueError("[-] - The users to to attempt was not a list with items in.")
+            raise ValueError("[-] The users list is empty or invalid.")
         self.users = users
 
-        # Validate Passwords list
-        if not isinstance(passwords, list) or not users:
-            raise ValueError("[-] - The users to to attempt was not a list with items in.")
+        # Validate Passwords
+        if not isinstance(passwords, list) or not passwords:
+            raise ValueError("[-] The passwords list is empty or invalid.")
         self.passwords = passwords
-        
+
+        # State
+        self.creds_found = False
+        self.lock = threading.Lock()
+        self.start = None
+        self.end = None
+        self.total_attempts = len(users) * len(passwords)
+        self.attempt_counter = 0
+        self.stop_event = threading.Event()
+
     def test_connection(self):
-        if self.service.connect(self.ip, self.port, "test", "adidfhudgaduydfguiadhg fuioa ngkfcgsiufhkjnfkasdhgfuyadgbuf") is None:
-            print(f"[-] - COULD NOT CONNECT TO {self.ip}:{self.port}... EXITTING!")
-            self._exit()
+        """Test if the target service is reachable."""
+        if self.service.connect(self.ip, self.port, "test", "dummy_invalid_password_xyz123") is None:
+            print(f"[-] Could not connect to {self.ip}:{self.port}... exiting!")
+            sys.exit(1)
+
+    def _partition(self, data, n):
+        """Split passwords into n chunks."""
+        k, m = divmod(len(data), n)
+        return [data[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
+
+    def _worker(self, user, chunk):
+        for pwd in chunk:
+            if self.creds_found or self.stop_event.is_set():
+                return
+
+            pwd_clean = Cerbrutus.Wordlist.clean_word(pwd)
+            auth_result = self.service.connect(self.ip, self.port, user, pwd_clean)
+
+            with self.lock:
+                self.attempt_counter += 1
+                sys.stdout.write(f"\r[*] Attempt {self.attempt_counter}/{self.total_attempts}")
+                sys.stdout.flush()
+
+            if auth_result:
+                with self.lock:
+                    if not self.creds_found:  # double-check after locking
+                        self.creds_found = True
+                        self.end = time.time()
+                        print(f"\n{Fore.GREEN}[+] VALID CREDENTIALS: {user}:{pwd_clean}{Style.RESET_ALL}")
+                        print(f"[*] Took {self.attempt_counter} tries in {(self.end - self.start):.2f} seconds.")
+                        self.stop_event.set()  # Signal other workers to stop
+                        return
 
     def brute(self):
-        self.start = time.time()
-        self.creds_found = False
         self.test_connection()
+        print(f"[*] Starting brute force against {self.ip}:{self.port}")
+        self.start = time.time()
 
-        for user in self.users:
-            print(f"[*] - Starting attack against {user}@{self.ip}:{self.port}")
-            for pwd in self.passwords: 
-                if self.creds_found:
-                    self._exit()
-                self.passwords[self.passwords.index(pwd)] = pwd = Cerbrutus.Wordlist.clean_word(pwd)
-                thread = threading.Thread(target=self._auth, args=(user, pwd))
-                self.threads.append(thread)
-                while threading.active_count() > self.threads_num + 1:
-                    continue
-                sys.stdout.write(f"\r[*] - Trying: {self.passwords.index(pwd) + 1}/{len(self.passwords)}")
-                thread.start()
-        self._exit()
+        executor = ThreadPoolExecutor(max_workers=self.threads_num)
+        try:
+            futures = []
+            for user in self.users:
+                if self.creds_found or self.stop_event.is_set():
+                    break
+                print(f"[*] Testing user: {user}")
+                partitions = self._partition(self.passwords, self.threads_num)
+                for chunk in partitions:
+                    if self.creds_found or self.stop_event.is_set():
+                        break
+                    future = executor.submit(self._worker, user, chunk)
+                    futures.append(future)
+            
+            # A way to constantly run the main loop to listen out for termination signals (needed for Windows)
+            while not (self.creds_found or self.stop_event.is_set()):
+                if not any(not f.done() for f in futures):
+                    break
+                time.sleep(0.1)
+        
+        except KeyboardInterrupt:
+            self.stop_event.set()
+            print('\nCtrl+C pressed')
+        
+        finally:
+            # Force shutdown without waiting if we found creds or got interrupted
+            if self.creds_found or self.stop_event.is_set():
+                executor.shutdown(wait=False)
+            else:
+                executor.shutdown(wait=True)
 
-    def _auth(self, user, pwd):
-        if self.creds_found:
-            return
-        # sys.stdout.write(f"\r{user}:{pwd}                     ")
-        auth_result = self.service.connect(self.ip, self.port, user, pwd)
-        if auth_result:
-            self.creds_found = True 
-            time.sleep(2)
-            print()
-            print(f"{Fore.GREEN}\033[1m[+] - VALID CREDENTIALS FOUND:\n\t{user}:{pwd}{Style.RESET_ALL}")
-            print(f"[*] - Took {(self.passwords.index(pwd)+1)*(self.users.index(user)+1)} tries")
+        if not self.creds_found:
             self.end = time.time()
-            print(f"[*] Total time - {self.end - self.start} seconds.")
-
-    def _thread_collection(self):
-        for thread in self.threads:
-            try:
-                thread.join()
-            except RuntimeError:
-                pass
-
-    def _exit(self):
-        if not self.creds_found:
-            print("\n[*] - Approaching final keyspace...")
-
-        self._thread_collection()
-
-        if not self.creds_found:
-                print(f"{Fore.RED}\033[1m[-] - Failed to find valid credentials for {self.ip}:{self.port}{Style.RESET_ALL}")
-                self.end = time.time()
-                print(f"[*] Total time - {self.end - self.start} seconds.")
-
-        sys.exit()
+            print(f"\n{Fore.RED}[-] Failed to find valid credentials.{Style.RESET_ALL}")
+            print(f"[*] Total time: {(self.end - self.start):.2f} seconds.")
