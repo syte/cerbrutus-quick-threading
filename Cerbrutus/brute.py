@@ -117,7 +117,7 @@ class BruteUtil:
         
         except KeyboardInterrupt:
             self.stop_event.set()
-            print('\nCtrl+C pressed')
+            print('\n[*] Terminating process....')
         
         finally:
             # Force shutdown without waiting if we found creds or got interrupted
@@ -130,3 +130,4 @@ class BruteUtil:
             self.end = time.time()
             print(f"\n{Fore.RED}[-] Failed to find valid credentials.{Style.RESET_ALL}")
             print(f"[*] Total time: {(self.end - self.start):.2f} seconds.")
+
